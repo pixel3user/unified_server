@@ -9,43 +9,6 @@ import types
 import urllib.error
 import urllib.request
 import asyncio
-import functools
-
-# CUDA Stream Isolation (Claude Recommendation)
-MUSE_STREAM = None
-PP_STREAM = None
-
-def _get_muse_stream():
-    global MUSE_STREAM
-    if MUSE_STREAM is None and torch.cuda.is_available():
-        MUSE_STREAM = torch.cuda.Stream()
-    return MUSE_STREAM
-
-def _get_pp_stream():
-    global PP_STREAM
-    if PP_STREAM is None and torch.cuda.is_available():
-        PP_STREAM = torch.cuda.Stream()
-    return PP_STREAM
-
-def _wrap_with_stream(func, stream_getter):
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        stream = stream_getter()
-        if stream:
-            with torch.cuda.stream(stream):
-                return func(*args, **kwargs)
-        return func(*args, **kwargs)
-    return wrapper
-
-def _wrap_with_stream_async(func, stream_getter):
-    @functools.wraps(func)
-    async def wrapper(*args, **kwargs):
-        stream = stream_getter()
-        if stream:
-            with torch.cuda.stream(stream):
-                return await func(*args, **kwargs)
-        return await func(*args, **kwargs)
-    return wrapper
 
 from aiohttp import web
 from huggingface_hub import hf_hub_download
@@ -475,6 +438,9 @@ class CloudflareTurnProvider:
             headers={
                 "Authorization": f"Bearer {self.api_token}",
                 "Content-Type": "application/json",
+                # Cloudflare rejects the default Python urllib fingerprint in this
+                # environment with HTTP 403 / error code 1010, while curl/aiohttp
+                # with an explicit user-agent succeeds.
                 "User-Agent": "onebox-turn-probe/1.0",
                 "Accept": "application/json",
             },
@@ -559,6 +525,9 @@ def _install_cloudflare_turn(musetalk_app_state: WebRtcApp) -> None:
 
     def _cloudflare_aiortc_ice_servers(self):
         if browser_only:
+            # In this deployment the browser benefits from Cloudflare TURN, but
+            # the server-side aiortc/aioice leg is more reliable with its
+            # original ICE config (typically direct/public candidates or STUN).
             return original_aiortc_ice_servers()
         try:
             rtc_cfg = provider.get_config()
@@ -610,11 +579,6 @@ def _install_cloudflare_turn(musetalk_app_state: WebRtcApp) -> None:
     musetalk_app_state.config = types.MethodType(_cloudflare_config, musetalk_app_state)
     musetalk_app_state.config_v1 = types.MethodType(_cloudflare_config_v1, musetalk_app_state)
 
-    if musetalk_app_state.engine is not None:
-        musetalk_app_state.engine._infer_window_frames = _wrap_with_stream(
-            musetalk_app_state.engine._infer_window_frames, _get_muse_stream
-        )
-
 
 def _build_personaplex_state() -> PersonaPlexState:
     hf_repo = os.environ.get("HF_REPO", personaplex_loaders.DEFAULT_REPO)
@@ -624,6 +588,8 @@ def _build_personaplex_state() -> PersonaPlexState:
     seed_all(42424242)
     _log_cuda_mem("personaplex.start")
 
+    # Match PersonaPlex's normal startup flow so unified mode behaves the same
+    # as the standalone server while still sharing a single process.
     hf_hub_download(hf_repo, "config.json")
 
     print("[unified_server] Loading PersonaPlex models...")
@@ -661,14 +627,6 @@ def _build_personaplex_state() -> PersonaPlexState:
         device=device,
         voice_prompt_dir=voice_prompt_dir,
     )
-
-    # Patch PersonaPlex core methods with dedicated stream
-    state.mimi.encode = _wrap_with_stream(state.mimi.encode, _get_pp_stream)
-    state.mimi.decode = _wrap_with_stream(state.mimi.decode, _get_pp_stream)
-    state.other_mimi.encode = _wrap_with_stream(state.other_mimi.encode, _get_pp_stream)
-    state.other_mimi.decode = _wrap_with_stream(state.other_mimi.decode, _get_pp_stream)
-    state.lm_gen.step = _wrap_with_stream(state.lm_gen.step, _get_pp_stream)
-
     print("[unified_server] PersonaPlex models loaded. Warming up...")
     _log_cuda_mem("personaplex.before_warmup")
     state.warmup()
@@ -759,20 +717,9 @@ def _build_app() -> tuple[web.Application, str, int]:
     if hasattr(musetalk_app_state, "cloudflare_turn_provider"):
         app["cloudflare_turn_provider"] = musetalk_app_state.cloudflare_turn_provider
 
-    if not musetalk_args.musetalk_only:
-        personaplex_state = _build_personaplex_state()
-        app["personaplex_state"] = personaplex_state
-        _install_personaplex_runtime_routes(app, personaplex_state)
-    else:
-        print("[unified_server] musetalk_only=True: skipping PersonaPlex model load.")
-        runtime = _new_runtime_state()
-        runtime["musetalk_only_mode"] = True
-        app["personaplex_runtime"] = runtime
-
-        async def personaplex_runtime_status_minimal(_request: web.Request):
-            runtime["gpu"] = _cuda_mem_stats()
-            return web.json_response(runtime)
-        app.router.add_get("/personaplex/runtime", personaplex_runtime_status_minimal)
+    personaplex_state = _build_personaplex_state()
+    app["personaplex_state"] = personaplex_state
+    _install_personaplex_runtime_routes(app, personaplex_state)
 
     return app, musetalk_args.host, musetalk_args.port
 
@@ -782,19 +729,16 @@ def main() -> None:
     app, host, port = _build_app()
     cert_path = os.environ.get("ONEBOX_TLS_CERT_PATH", "/tmp/onebox.crt")
     key_path = os.environ.get("ONEBOX_TLS_KEY_PATH", "/tmp/onebox.key")
-    tls_enabled = os.environ.get("ONEBOX_TLS_ENABLE", "1") == "1"
     internal_host = os.environ.get("ONEBOX_INTERNAL_HTTP_HOST", "127.0.0.1")
     internal_port = int(os.environ.get("ONEBOX_INTERNAL_HTTP_PORT", str(port + 1)))
     ssl_ctx = None
     scheme = "http"
 
-    if tls_enabled and os.path.exists(cert_path) and os.path.exists(key_path):
+    if os.path.exists(cert_path) and os.path.exists(key_path):
         ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ssl_ctx.load_cert_chain(cert_path, key_path)
         scheme = "https"
         print(f"[unified_server] TLS enabled with cert={cert_path} key={key_path}")
-    elif not tls_enabled:
-        print("[unified_server] TLS disabled by ONEBOX_TLS_ENABLE=0")
     else:
         print(
             "[unified_server] TLS disabled because certificate files were not found: "

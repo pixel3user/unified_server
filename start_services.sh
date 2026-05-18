@@ -8,13 +8,9 @@ log() {
 
 turn_pid=""
 unified_server_pid=""
-nginx_pid=""
-certbot_renew_pid=""
 
 cleanup() {
   set +e
-  if [[ -n "${certbot_renew_pid}" ]]; then kill "${certbot_renew_pid}" 2>/dev/null || true; fi
-  if [[ -n "${nginx_pid}" ]]; then kill "${nginx_pid}" 2>/dev/null || true; fi
   if [[ -n "${unified_server_pid}" ]]; then kill "${unified_server_pid}" 2>/dev/null || true; fi
   if [[ -n "${turn_pid}" ]]; then kill "${turn_pid}" 2>/dev/null || true; fi
 }
@@ -55,88 +51,6 @@ ensure_https_cert() {
     -out "${cert_path}" \
     -subj "/CN=${cert_cn}" \
     -addext "subjectAltName = ${san_entry}"
-}
-
-start_nginx_proxy() {
-  local template_path="/opt/onebox/nginx/container-onebox.conf.template"
-  local nginx_conf_path="/etc/nginx/conf.d/onebox.conf"
-  local server_name="${ONEBOX_PUBLIC_HOST:-_}"
-  local cert_path="${ONEBOX_NGINX_SSL_CERT_PATH:-${ONEBOX_TLS_CERT_PATH}}"
-  local key_path="${ONEBOX_NGINX_SSL_KEY_PATH:-${ONEBOX_TLS_KEY_PATH}}"
-  local upstream_host="${ONEBOX_NGINX_UPSTREAM_HOST:-127.0.0.1}"
-  local upstream_port="${ONEBOX_NGINX_UPSTREAM_PORT:-${MUSE_PORT:-8780}}"
-
-  if [[ ! -f "${template_path}" ]]; then
-    log "missing nginx template: ${template_path}"
-    exit 1
-  fi
-
-  mkdir -p /var/www/certbot /run/nginx
-  render_nginx_proxy_config "${server_name}" "${cert_path}" "${key_path}" "${upstream_host}" "${upstream_port}" "${nginx_conf_path}"
-
-  nginx -t
-  nginx -g 'daemon off;' &
-  nginx_pid=$!
-  log "nginx reverse proxy started (PID: ${nginx_pid}) on :80/:443"
-}
-
-render_nginx_proxy_config() {
-  local server_name="$1"
-  local cert_path="$2"
-  local key_path="$3"
-  local upstream_host="$4"
-  local upstream_port="$5"
-  local nginx_conf_path="$6"
-
-  sed \
-    -e "s|__SERVER_NAME__|${server_name}|g" \
-    -e "s|__SSL_CERT_PATH__|${cert_path}|g" \
-    -e "s|__SSL_KEY_PATH__|${key_path}|g" \
-    -e "s|__UPSTREAM_HOST__|${upstream_host}|g" \
-    -e "s|__UPSTREAM_PORT__|${upstream_port}|g" \
-    "/opt/onebox/nginx/container-onebox.conf.template" > "${nginx_conf_path}"
-}
-
-obtain_letsencrypt_cert() {
-  local domain="${ONEBOX_PUBLIC_HOST:-}"
-  local email="${LETSENCRYPT_EMAIL:-${CERTBOT_EMAIL:-}}"
-  local cert_path="${ONEBOX_LETSENCRYPT_CERT_PATH:-/etc/letsencrypt/live/${domain}/fullchain.pem}"
-  local key_path="${ONEBOX_LETSENCRYPT_KEY_PATH:-/etc/letsencrypt/live/${domain}/privkey.pem}"
-
-  if [[ -z "${domain}" || -z "${email}" ]]; then
-    log "Let's Encrypt skipped because ONEBOX_PUBLIC_HOST or LETSENCRYPT_EMAIL is not set"
-    return 1
-  fi
-
-  if [[ -s "${cert_path}" && -s "${key_path}" ]]; then
-    log "using existing Let's Encrypt certificate for ${domain}"
-    return 0
-  fi
-
-  log "requesting Let's Encrypt certificate for ${domain}"
-  certbot certonly \
-    --webroot \
-    --webroot-path /var/www/certbot \
-    --non-interactive \
-    --agree-tos \
-    --email "${email}" \
-    -d "${domain}"
-}
-
-start_certbot_renew_loop() {
-  if [[ "${ONEBOX_LETSENCRYPT_ENABLE:-0}" != "1" ]]; then
-    return
-  fi
-
-  (
-    while true; do
-      sleep "${CERTBOT_RENEW_INTERVAL_SECONDS:-43200}"
-      certbot renew --webroot -w /var/www/certbot --quiet --deploy-hook "nginx -s reload" || \
-        log "certbot renew failed; will retry later"
-    done
-  ) &
-  certbot_renew_pid=$!
-  log "certbot renewal loop started (PID: ${certbot_renew_pid})"
 }
 
 # ============================================================================
@@ -272,7 +186,7 @@ export MUSE_WINDOW_MS="${MUSE_WINDOW_MS:-640}"
 export MUSE_HOP_MS="${MUSE_HOP_MS:-80}"
 export MUSE_MIN_WINDOW_MS="${MUSE_MIN_WINDOW_MS:-320}"
 export MUSE_MAX_ADVANCE_MS="${MUSE_MAX_ADVANCE_MS:-240}"
-export MUSE_MAX_TAIL_FRAMES="${MUSE_MAX_TAIL_FRAMES:-32}"
+export MUSE_MAX_TAIL_FRAMES="${MUSE_MAX_TAIL_FRAMES:-5}"
 export MUSE_MOUTH_SMOOTHING_ALPHA="${MUSE_MOUTH_SMOOTHING_ALPHA:-0.75}"
 export MUSE_USE_FP16="${MUSE_USE_FP16:-1}"
 export MUSE_REQUIRE_MMPOSE="${MUSE_REQUIRE_MMPOSE:-0}"
@@ -302,8 +216,6 @@ export ONEBOX_TLS_CERT_PATH="${ONEBOX_TLS_CERT_PATH:-/tmp/onebox.crt}"
 export ONEBOX_TLS_KEY_PATH="${ONEBOX_TLS_KEY_PATH:-/tmp/onebox.key}"
 export ONEBOX_TLS_ENABLE="${ONEBOX_TLS_ENABLE:-1}"
 export ONEBOX_TLS_CN="${ONEBOX_TLS_CN:-${ONEBOX_PUBLIC_HOST:-127.0.0.1}}"
-export ONEBOX_LETSENCRYPT_ENABLE="${ONEBOX_LETSENCRYPT_ENABLE:-0}"
-export ONEBOX_NGINX_ENABLE="${ONEBOX_NGINX_ENABLE:-0}"
 export ONEBOX_INTERNAL_HTTP_HOST="${ONEBOX_INTERNAL_HTTP_HOST:-127.0.0.1}"
 export ONEBOX_INTERNAL_HTTP_PORT="${ONEBOX_INTERNAL_HTTP_PORT:-$((MUSE_PORT + 1))}"
 export TURN_PUBLIC_HOST="${TURN_PUBLIC_HOST:-${ONEBOX_PUBLIC_HOST:-}}"
@@ -314,10 +226,6 @@ if [[ "${MUSE_HOST}" != "0.0.0.0" && "${MUSE_HOST}" != "::" ]]; then
 fi
 export PERSONAPLEX_HOST="${PERSONAPLEX_HOST:-${ONEBOX_INTERNAL_HTTP_HOST}}" # Internal unified target host
 export PERSONAPLEX_PORT="${PERSONAPLEX_PORT:-${ONEBOX_INTERNAL_HTTP_PORT}}" # Loopback HTTP listener for internal bridge
-
-if [[ "${ONEBOX_NGINX_ENABLE}" == "1" ]]; then
-  export ONEBOX_TLS_ENABLE=0
-fi
 
 if [[ "${ONEBOX_TLS_ENABLE}" == "1" ]]; then
   ensure_https_cert
@@ -330,7 +238,6 @@ unified_args=(
   --version "${MUSE_VERSION}"
   --gpu-id "${MUSE_GPU_ID}"
   --fps "${MUSE_FPS}"
-  --avatar-fps "${MUSE_AVATAR_FPS:-$MUSE_FPS}"
   --batch-size "${MUSE_BATCH_SIZE}"
   --window-ms "${MUSE_WINDOW_MS}"
   --hop-ms "${MUSE_HOP_MS}"
@@ -393,49 +300,11 @@ unified_server_pid=$!
 
 log "Unified Server started (PID: ${unified_server_pid})"
 
-if [[ "${ONEBOX_NGINX_ENABLE:-0}" == "1" ]]; then
-  if [[ "${ONEBOX_LETSENCRYPT_ENABLE}" == "1" ]]; then
-    export ONEBOX_LETSENCRYPT_CERT_PATH="/etc/letsencrypt/live/${ONEBOX_PUBLIC_HOST}/fullchain.pem"
-    export ONEBOX_LETSENCRYPT_KEY_PATH="/etc/letsencrypt/live/${ONEBOX_PUBLIC_HOST}/privkey.pem"
-    if [[ -s "${ONEBOX_LETSENCRYPT_CERT_PATH}" && -s "${ONEBOX_LETSENCRYPT_KEY_PATH}" ]]; then
-      export ONEBOX_NGINX_SSL_CERT_PATH="${ONEBOX_LETSENCRYPT_CERT_PATH}"
-      export ONEBOX_NGINX_SSL_KEY_PATH="${ONEBOX_LETSENCRYPT_KEY_PATH}"
-    else
-      export ONEBOX_NGINX_SSL_CERT_PATH="/tmp/onebox-bootstrap.crt"
-      export ONEBOX_NGINX_SSL_KEY_PATH="/tmp/onebox-bootstrap.key"
-      export ONEBOX_TLS_CERT_PATH="${ONEBOX_NGINX_SSL_CERT_PATH}"
-      export ONEBOX_TLS_KEY_PATH="${ONEBOX_NGINX_SSL_KEY_PATH}"
-      ensure_https_cert
-    fi
-    start_nginx_proxy
-    obtain_letsencrypt_cert
-    export ONEBOX_NGINX_SSL_CERT_PATH="${ONEBOX_LETSENCRYPT_CERT_PATH}"
-    export ONEBOX_NGINX_SSL_KEY_PATH="${ONEBOX_LETSENCRYPT_KEY_PATH}"
-    render_nginx_proxy_config \
-      "${ONEBOX_PUBLIC_HOST:-_}" \
-      "${ONEBOX_NGINX_SSL_CERT_PATH}" \
-      "${ONEBOX_NGINX_SSL_KEY_PATH}" \
-      "${ONEBOX_NGINX_UPSTREAM_HOST:-127.0.0.1}" \
-      "${ONEBOX_NGINX_UPSTREAM_PORT:-${MUSE_PORT:-8780}}" \
-      "/etc/nginx/conf.d/onebox.conf"
-    nginx -s reload
-    rm -f /tmp/onebox-bootstrap.crt /tmp/onebox-bootstrap.key
-    start_certbot_renew_loop
-  else
-    export ONEBOX_NGINX_SSL_CERT_PATH="${ONEBOX_NGINX_SSL_CERT_PATH:-/tmp/onebox.crt}"
-    export ONEBOX_NGINX_SSL_KEY_PATH="${ONEBOX_NGINX_SSL_KEY_PATH:-/tmp/onebox.key}"
-    export ONEBOX_TLS_CERT_PATH="${ONEBOX_NGINX_SSL_CERT_PATH}"
-    export ONEBOX_TLS_KEY_PATH="${ONEBOX_NGINX_SSL_KEY_PATH}"
-    ensure_https_cert
-    start_nginx_proxy
-  fi
-fi
-
 # ============================================================================
 # Wait for services and handle shutdown
 # ============================================================================
 set +e
-wait -n "${unified_server_pid}" ${turn_pid:+"${turn_pid}"} ${nginx_pid:+"${nginx_pid}"} ${certbot_renew_pid:+"${certbot_renew_pid}"}
+wait -n "${unified_server_pid}" ${turn_pid:+"${turn_pid}"}
 status=$?
 set -e
 

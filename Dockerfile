@@ -26,20 +26,18 @@ ARG MMCV_VERSION=2.1.0
 ARG MMENGINE_VERSION=0.10.7
 ARG MMDET_VERSION=3.2.0
 ARG MMPOSE_VERSION=1.3.2
-ARG TORCH_CUDA_ARCH_LIST="8.9;12.0"
+ARG TORCH_CUDA_ARCH_LIST="9.0"
 
 # Repository configuration - SHOULD BE COMMIT SHAs IN PRODUCTION
 ARG MUSETALK_REPO=https://github.com/pixel3user/MuseTalk.git
 ARG MUSETALK_REF=main
 ARG PERSONAPLEX_REPO=https://github.com/pixel3user/personaplex.git
 ARG PERSONAPLEX_REF=main
-ARG CUSTOM_VOICE_REPO="ColdSlim/custom-voices"
+ARG CUSTOM_VOICE_URL=""
 ARG CUSTOM_VOICE_FILENAME="myvoice.pt"
-ARG HF_TOKEN=""
 
 # Feature flags
 ARG INSTALL_MMPOSE=1
-ARG SMOKE_TEST=1
 
 # Install build dependencies
 RUN rm -rf /var/lib/apt/lists/* && apt-get update && apt-get install -y --no-install-recommends \
@@ -108,7 +106,7 @@ RUN sed -i 's/pip install -U "huggingface_hub\[cli\]"/pip install "huggingface_h
     sed -i 's/\<huggingface-cli\>/hf/g' /opt/musetalk/download_weights.sh
 
 # Create hf wrapper script
-RUN printf '#!/bin/sh\n/opt/venv/bin/python -m huggingface_hub.commands.huggingface_cli "$@"\n' > /usr/bin/hf && \
+RUN printf '#!/bin/sh\npython -m huggingface_hub.commands.huggingface_cli "$@"\n' > /usr/bin/hf && \
     chmod +x /usr/bin/hf
 
 # ============================================================================
@@ -154,12 +152,14 @@ RUN pip install --no-cache-dir -e /opt/personaplex/moshi --no-deps
 # Vendor custom PersonaPlex voices (optional)
 # ============================================================================
 RUN mkdir -p /opt/personaplex/custom_voices && \
-    if [ -n "${CUSTOM_VOICE_REPO}" ]; then \
-      echo "Downloading custom PersonaPlex voice from HF: ${CUSTOM_VOICE_REPO}/${CUSTOM_VOICE_FILENAME}" && \
-      hf download "${CUSTOM_VOICE_REPO}" "${CUSTOM_VOICE_FILENAME}" --local-dir /opt/personaplex/custom_voices --token "${HF_TOKEN}" && \
+    if [ -n "${CUSTOM_VOICE_URL}" ]; then \
+      echo "Downloading custom PersonaPlex voice to /opt/personaplex/custom_voices/${CUSTOM_VOICE_FILENAME}" && \
+      curl -L --fail --retry 3 --retry-delay 2 \
+        "${CUSTOM_VOICE_URL}" \
+        -o "/opt/personaplex/custom_voices/${CUSTOM_VOICE_FILENAME}" && \
       test -s "/opt/personaplex/custom_voices/${CUSTOM_VOICE_FILENAME}"; \
     else \
-      echo "No CUSTOM_VOICE_REPO provided; skipping custom voice download."; \
+      echo "No CUSTOM_VOICE_URL provided; skipping custom voice download."; \
     fi
 
 # ============================================================================
@@ -180,12 +180,8 @@ RUN pip freeze > /opt/venv/frozen-requirements.txt && \
 # SMOKE TESTS - Fail build if anything is broken
 # ============================================================================
 COPY smoke_test.py /opt/
-RUN if [ "${SMOKE_TEST}" = "1" ]; then \
-      echo "=== Running Build-Time Smoke Tests ===" && \
-      python /opt/smoke_test.py; \
-    else \
-      echo "Skipping build-time smoke tests (SMOKE_TEST=0)."; \
-    fi
+RUN echo "=== Running Build-Time Smoke Tests ===" && \
+    python /opt/smoke_test.py
 
 # ============================================================================
 # Stage 2: Runtime - ONLY copy artifacts, NO pip install
@@ -194,7 +190,6 @@ FROM nvidia/cuda:13.0.0-cudnn-runtime-ubuntu22.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG INSTALL_MMPOSE=1
-ARG SMOKE_TEST=1
 
 # Install ONLY runtime system dependencies (no Python build tools)
 RUN rm -rf /var/lib/apt/lists/* && apt-get update && apt-get install -y --no-install-recommends \
@@ -215,8 +210,6 @@ RUN rm -rf /var/lib/apt/lists/* && apt-get update && apt-get install -y --no-ins
     libgomp1 \
     coturn \
     netcat-openbsd \
-    nginx \
-    certbot \
  && rm -rf /var/lib/apt/lists/*
 
 # Copy COMPLETE virtual environment from builder
@@ -239,7 +232,6 @@ COPY --from=builder /opt/venv/frozen-requirements.txt /opt/
 # Copy startup scripts
 COPY start_services.sh /opt/onebox/start_services.sh
 COPY unified_server.py /opt/onebox/unified_server.py
-COPY nginx/container-onebox.conf.template /opt/onebox/nginx/container-onebox.conf.template
 RUN chmod +x /opt/onebox/start_services.sh
 
 # Environment configuration
@@ -250,11 +242,9 @@ ENV TORCH_HOME=/root/.cache/torch
 ENV VOICE_PROMPT_DIR=/opt/personaplex/custom_voices
 
 # Validate runtime environment (quick sanity check)
-RUN if [ "${SMOKE_TEST}" = "1" ]; then \
-      python -c "import torch; import mmcv; print(f'Runtime check: torch={torch.__version__}, mmcv={mmcv.__version__}')"; \
-    fi
+RUN python -c "import torch; import mmcv; print(f'Runtime check: torch={torch.__version__}, mmcv={mmcv.__version__}')"
 
 # Expose ports
-EXPOSE 80 443 8780 8998 3478/tcp 3478/udp 5349/tcp
+EXPOSE 8780 8998 3478/tcp 3478/udp 5349/tcp
 
 ENTRYPOINT ["/opt/onebox/start_services.sh"]

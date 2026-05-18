@@ -19,24 +19,12 @@ IMAGE_TAG="${IMAGE_TAG:-coldslim/musetalk-onebox:blackwell}"
 BUILDER_IMAGE_TAG="musetalk-onebox-builder:blackwell"
 
 # Repository configuration
-# Default to the current local repo branches when available.
-LOCAL_MUSETALK_DIR="${LOCAL_MUSETALK_DIR:-$(cd "$(dirname "$0")/.." && pwd)/MuseTalk}"
-LOCAL_PERSONAPLEX_DIR="${LOCAL_PERSONAPLEX_DIR:-$(cd "$(dirname "$0")/.." && pwd)/personaplex}"
-DEFAULT_MUSETALK_REF="main"
-DEFAULT_PERSONAPLEX_REF="main"
-if [[ -d "${LOCAL_MUSETALK_DIR}/.git" ]]; then
-  DEFAULT_MUSETALK_REF="$(git -C "${LOCAL_MUSETALK_DIR}" branch --show-current || echo main)"
-fi
-if [[ -d "${LOCAL_PERSONAPLEX_DIR}/.git" ]]; then
-  DEFAULT_PERSONAPLEX_REF="$(git -C "${LOCAL_PERSONAPLEX_DIR}" branch --show-current || echo main)"
-fi
+# PRODUCTION: Pin these to commit SHAs
+# DEVELOPMENT: Override with MUSETALK_REF=main ./build_onebox.sh
 MUSETALK_REPO="${MUSETALK_REPO:-https://github.com/pixel3user/MuseTalk.git}"
-MUSETALK_REF="${MUSETALK_REF:-${DEFAULT_MUSETALK_REF}}"
+MUSETALK_REF="${MUSETALK_REF:-main}"  # TODO: Replace with commit SHA
 PERSONAPLEX_REPO="${PERSONAPLEX_REPO:-https://github.com/pixel3user/personaplex.git}"
-PERSONAPLEX_REF="${PERSONAPLEX_REF:-${DEFAULT_PERSONAPLEX_REF}}"
-
-# Authentication
-HF_TOKEN="${HF_TOKEN:-}"
+PERSONAPLEX_REF="${PERSONAPLEX_REF:-main}"  # TODO: Replace with commit SHA
 
 # Python version
 PYTHON_VERSION="${PYTHON_VERSION:-3.10}"
@@ -53,13 +41,13 @@ MMCV_VERSION="${MMCV_VERSION:-2.1.0}"
 MMENGINE_VERSION="${MMENGINE_VERSION:-0.10.7}"
 MMDET_VERSION="${MMDET_VERSION:-3.2.0}"
 MMPOSE_VERSION="${MMPOSE_VERSION:-1.3.2}"
-TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.9;12.0}"
+TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}"
 
 # Feature flags
 INSTALL_MMPOSE="${INSTALL_MMPOSE:-1}"
 
-# Optional custom PersonaPlex voice vendoring (Hugging Face)
-CUSTOM_VOICE_REPO="${CUSTOM_VOICE_REPO:-ColdSlim/custom-voices}"
+# Optional custom PersonaPlex voice vendoring
+CUSTOM_VOICE_URL="${CUSTOM_VOICE_URL:-}"
 CUSTOM_VOICE_FILENAME="${CUSTOM_VOICE_FILENAME:-myvoice.pt}"
 
 # Build behavior
@@ -116,10 +104,18 @@ should_run_runtime_smoke_test() {
 # Validation
 # ============================================================================
 
-echo "Using repo refs:"
-echo "  MuseTalk ref: ${MUSETALK_REF}"
-echo "  PersonaPlex ref: ${PERSONAPLEX_REF}"
-echo ""
+# Warn if using non-SHA refs
+if [[ "${MUSETALK_REF}" == "main" ]] || [[ "${MUSETALK_REF}" == "master" ]]; then
+  echo "⚠ WARNING: MUSETALK_REF=${MUSETALK_REF} (not a commit SHA)"
+  echo "  Builds will be non-reproducible. Pin to a commit SHA in production."
+  echo ""
+fi
+
+if [[ "${PERSONAPLEX_REF}" == "main" ]] || [[ "${PERSONAPLEX_REF}" == "master" ]]; then
+  echo "⚠ WARNING: PERSONAPLEX_REF=${PERSONAPLEX_REF} (not a commit SHA)"
+  echo "  Builds will be non-reproducible. Pin to a commit SHA in production."
+  echo ""
+fi
 
 # ============================================================================
 # Build Builder Stage
@@ -134,8 +130,8 @@ echo "MMCV: ${MMCV_VERSION}"
 echo "MuseTalk: ${MUSETALK_REPO}@${MUSETALK_REF}"
 echo "PersonaPlex: ${PERSONAPLEX_REPO}@${PERSONAPLEX_REF}"
 echo "Install MMPose: ${INSTALL_MMPOSE}"
-if [[ -n "${CUSTOM_VOICE_REPO}" ]]; then
-  echo "Custom voice: ${CUSTOM_VOICE_REPO}/${CUSTOM_VOICE_FILENAME} (Hugging Face)"
+if [[ -n "${CUSTOM_VOICE_URL}" ]]; then
+  echo "Custom voice: ${CUSTOM_VOICE_FILENAME}"
 else
   echo "Custom voice: disabled"
 fi
@@ -161,11 +157,9 @@ docker build \
   --build-arg MUSETALK_REF="${MUSETALK_REF}" \
   --build-arg PERSONAPLEX_REPO="${PERSONAPLEX_REPO}" \
   --build-arg PERSONAPLEX_REF="${PERSONAPLEX_REF}" \
-  --build-arg CUSTOM_VOICE_REPO="${CUSTOM_VOICE_REPO}" \
+  --build-arg CUSTOM_VOICE_URL="${CUSTOM_VOICE_URL}" \
   --build-arg CUSTOM_VOICE_FILENAME="${CUSTOM_VOICE_FILENAME}" \
-  --build-arg HF_TOKEN="${HF_TOKEN}" \
   --build-arg INSTALL_MMPOSE="${INSTALL_MMPOSE}" \
-  --build-arg SMOKE_TEST="${SMOKE_TEST}" \
   -t "${BUILDER_IMAGE_TAG}" \
   . || {
     echo ""
