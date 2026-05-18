@@ -693,12 +693,26 @@ def _install_personaplex_runtime_routes(app: web.Application, personaplex_state:
     app.router.add_get("/personaplex/runtime", personaplex_runtime_status)
 
 
-def _build_app() -> tuple[web.Application, str, int]:
+def _build_app(
+    *,
+    personaplex_builder=None,
+    engine_factory=None,
+) -> tuple[web.Application, str, int]:
+    """Build the unified aiohttp application.
+
+    Keyword args (for testability — production uses defaults):
+    - personaplex_builder: callable() -> PersonaPlexState. Default: _build_personaplex_state.
+    - engine_factory: callable(args, ring, buf) -> InferenceEngine. Default: real GPU engine.
+      Passed through to WebRtcApp so tests can inject FakeInferenceEngine.
+    """
     _patch_frontend()
     musetalk_args = parse_musetalk_args()
     print("[unified_server] Loading MuseTalk app...")
     _log_cuda_mem("musetalk.before_build_app")
-    musetalk_app_state = WebRtcApp(musetalk_args)
+    webrtc_kwargs = {}
+    if engine_factory is not None:
+        webrtc_kwargs["engine_factory"] = engine_factory
+    musetalk_app_state = WebRtcApp(musetalk_args, **webrtc_kwargs)
     _install_cloudflare_turn(musetalk_app_state)
     if hasattr(musetalk_app_state, "cloudflare_turn_provider"):
         provider = musetalk_app_state.cloudflare_turn_provider
@@ -717,7 +731,8 @@ def _build_app() -> tuple[web.Application, str, int]:
     if hasattr(musetalk_app_state, "cloudflare_turn_provider"):
         app["cloudflare_turn_provider"] = musetalk_app_state.cloudflare_turn_provider
 
-    personaplex_state = _build_personaplex_state()
+    pp_builder = personaplex_builder or _build_personaplex_state
+    personaplex_state = pp_builder()
     app["personaplex_state"] = personaplex_state
     _install_personaplex_runtime_routes(app, personaplex_state)
 
