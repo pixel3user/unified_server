@@ -60,6 +60,9 @@ def _mock_heavy_imports():
         av_mock.VideoFrame = type("VideoFrame", (), {"from_ndarray": staticmethod(lambda *a, **kw: None)})
         av_mock.AudioFrame = type("AudioFrame", (), {})
         sys.modules["av"] = av_mock
+    # Ensure torch mock has Tensor (cloudflare test may have installed a bare mock)
+    if "torch" in sys.modules and not hasattr(sys.modules["torch"], "Tensor"):
+        sys.modules["torch"].Tensor = type("Tensor", (), {})
 
 
 @pytest.fixture

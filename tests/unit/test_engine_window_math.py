@@ -104,8 +104,8 @@ class TestFakeEngineBasicBehavior:
         assert engine.jobs == 0
 
     @pytest.mark.asyncio
-    async def test_engine_tracks_dropped_audio(self, ring, video_buffer):
-        """When new_samples > max_advance, excess is tracked as dropped."""
+    async def test_engine_defers_excess_audio(self, ring, video_buffer):
+        """When new_samples > max_advance, excess is deferred to next iteration."""
         from scripts.musetalk_webrtc.engines.fake import FakeInferenceEngine
 
         args = make_test_args(
@@ -113,16 +113,17 @@ class TestFakeEngineBasicBehavior:
         )
         engine = FakeInferenceEngine(args, ring, video_buffer, simulated_inference_ms=1.0)
 
-        # Feed 500ms = 8000 samples (max_advance = 3840, so 4160 would be "dropped")
+        # Feed 500ms = 8000 samples (max_advance = 3840 per iteration)
         big_chunk = np.random.randn(8000).astype(np.float32) * 0.3
         await ring.append(big_chunk)
 
         task = asyncio.create_task(engine.run())
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.3)
         engine.stop_event.set()
         await task
 
-        assert engine.dropped_audio_ms_total > 0
+        # With the fix: audio is consumed across multiple iterations, not dropped
+        assert engine.jobs >= 2, f"Expected multiple jobs to consume burst, got {engine.jobs}"
 
     @pytest.mark.asyncio
     async def test_engine_failure_injection(self, ring, video_buffer):

@@ -37,8 +37,17 @@ for p in [str(MUSETALK_ROOT), str(UNIFIED_ROOT)]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from conftest import make_test_args
+# Ensure torch mock has Tensor
+if "torch" in sys.modules and not hasattr(sys.modules["torch"], "Tensor"):
+    sys.modules["torch"].Tensor = type("Tensor", (), {})
+
+# Import make_test_args from the parent tests/conftest.py via importlib
+import importlib.util
+_parent_conftest_path = Path(__file__).resolve().parent.parent / "conftest.py"
+_spec = importlib.util.spec_from_file_location("tests_conftest", _parent_conftest_path)
+_parent_conftest = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_parent_conftest)
+make_test_args = _parent_conftest.make_test_args
 
 
 @pytest.fixture

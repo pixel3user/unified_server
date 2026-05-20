@@ -26,6 +26,7 @@ for mod_name in _heavy_mocks:
         sys.modules[mod_name] = m
 
 # Add required attributes that unified_server.py references
+sys.modules["torch"].Tensor = type("Tensor", (), {})
 sys.modules["torch"].cuda = types.ModuleType("torch.cuda")
 sys.modules["torch"].cuda.is_available = lambda: False
 sys.modules["torch"].cuda.current_device = lambda: 0

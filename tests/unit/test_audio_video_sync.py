@@ -92,15 +92,6 @@ def _frames_drained_count(video_buffer) -> int:
     return n
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Bug: engine commits last_total_samples=total before clamping new_samples, "
-        "silently dropping audio above max_advance_ms. Audio still plays via "
-        "audio_track_buffer (no clamp), causing visible lipsync skip. "
-        "Fix needs GPU validation against real avatar timeline."
-    ),
-    strict=False,
-)
 @pytest.mark.asyncio
 async def test_no_silent_audio_drops_on_burst(ring, video_buffer):
     """A 1-second audio burst should be fully inferred over, not silently dropped.
@@ -134,14 +125,6 @@ async def test_no_silent_audio_drops_on_burst(ring, video_buffer):
     )
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Bug: max_tail_frames=5 caps published frames below what max_advance_ms "
-        "would generate. With max_advance_ms=240 and fps=25, each cycle drops "
-        "1 frame of video relative to the audio it consumes (40ms drift)."
-    ),
-    strict=False,
-)
 @pytest.mark.asyncio
 async def test_published_frames_match_consumed_audio(ring, video_buffer):
     """Per-cycle, published frame count should equal the frames implied by the
@@ -188,15 +171,6 @@ async def test_published_frames_match_consumed_audio(ring, video_buffer):
     )
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Bug: continuous bursts produce monotonic drift between audio "
-        "consumed and video published. Caused by both silent drops and "
-        "frame cap; tracked together because the user-visible symptom "
-        "is the same."
-    ),
-    strict=False,
-)
 @pytest.mark.asyncio
 async def test_audio_video_drift_stays_bounded_under_load(ring, video_buffer):
     """Over multiple bursts, accumulated drift should stay below 100ms.
@@ -255,7 +229,7 @@ async def test_audio_video_drift_stays_bounded_under_load(ring, video_buffer):
 
 @pytest.mark.asyncio
 async def test_engine_respects_max_advance_clamp(ring, video_buffer):
-    """When fed audio > max_advance_ms, the engine reports the drop in stats."""
+    """When fed audio > max_advance_ms, the engine defers excess to next iteration."""
     from scripts.musetalk_webrtc.engines.fake import FakeInferenceEngine
 
     args = make_test_args(window_ms=640, hop_ms=80, max_advance_ms=100, fps=25)
@@ -266,43 +240,46 @@ async def test_engine_respects_max_advance_clamp(ring, video_buffer):
     await ring.append(burst)
 
     task = asyncio.create_task(engine.run())
-    await asyncio.sleep(0.3)
+    await asyncio.sleep(0.5)
     engine.stop_event.set()
     await task
 
-    # The bug IS this drop happening. We just verify the bookkeeping is right.
-    assert engine.dropped_audio_ms_total > 0, (
-        "Expected the buggy clamp to register dropped audio so it's at least "
-        "VISIBLE in /status output."
+    # With the fix: audio is NOT dropped, it's consumed across multiple iterations.
+    # The engine should process all 500ms across ~5 iterations of 100ms each.
+    assert engine.jobs >= 4, (
+        f"Expected multiple iterations to consume the burst, got {engine.jobs}"
     )
+    # All audio consumed — frames should match total duration
+    expected_frames = int(round(0.5 * 25))  # 500ms at 25fps = ~12-13 frames
+    assert engine.frames_published >= expected_frames - 2
 
 
 @pytest.mark.asyncio
-async def test_engine_publishes_no_more_than_max_tail_frames_per_cycle(ring, video_buffer):
-    """Sanity: max_tail_frames really does cap published frames per cycle."""
+async def test_engine_publishes_frames_proportional_to_audio(ring, video_buffer):
+    """Frame count is derived from consumed audio duration, not artificially capped."""
     from scripts.musetalk_webrtc.engines.fake import FakeInferenceEngine
 
     args = make_test_args(
         window_ms=640,
         hop_ms=80,
-        max_advance_ms=1000,  # huge advance budget
+        max_advance_ms=1000,  # large advance budget — consume all at once
         fps=25,
-        max_tail_frames=3,    # but only 3 frames per cycle
+        max_tail_frames=3,    # this cap is now ignored
     )
     engine = FakeInferenceEngine(args, ring, video_buffer, simulated_inference_ms=2.0)
 
-    # 1 second of audio → would naively yield 25 frames, but capped to 3 per cycle.
-    burst = np.random.randn(16000).astype(np.float32) * 0.5
+    # 640ms of audio → should yield ~16 frames at 25fps in one cycle
+    burst = np.random.randn(int(16000 * 0.64)).astype(np.float32) * 0.5
     await ring.append(burst)
 
-    # Run for just one cycle's worth of time — only the first batch should fire.
     task = asyncio.create_task(engine.run())
-    await asyncio.sleep(0.05)
+    await asyncio.sleep(0.1)
     engine.stop_event.set()
     await task
 
-    assert engine.jobs <= 1
-    assert engine.frames_published <= 3, (
-        f"Published {engine.frames_published} frames in one cycle, "
-        "expected at most max_tail_frames=3."
+    assert engine.jobs == 1
+    # Should publish frames proportional to audio, NOT capped at max_tail_frames
+    expected = int(round(0.64 * 25))  # ~16 frames
+    assert engine.frames_published >= expected - 1, (
+        f"Published {engine.frames_published} frames, expected ~{expected}"
     )
