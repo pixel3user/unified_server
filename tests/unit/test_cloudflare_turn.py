@@ -194,3 +194,192 @@ class TestDebugIdentity:
         assert "api_token_sha256_prefix" in identity
         assert len(identity["token_id_prefix"]) == 8
         assert len(identity["token_id_suffix"]) == 6
+
+
+
+
+class _FakeClock:
+    """Manually-advanced clock for deterministic circuit breaker tests."""
+
+    def __init__(self, t: float = 0.0) -> None:
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, dt: float) -> None:
+        self.t += dt
+
+
+class TestCircuitBreaker:
+    """Verify open/closed/half-open transitions and fast-fail behavior.
+
+    These tests exist because the production bug was: every new WebRTC
+    /offer would block ~15s on an HTTP timeout when Cloudflare was down.
+    The breaker must skip the network call entirely while in 'open' state.
+    """
+
+    @pytest.fixture
+    def clock(self):
+        return _FakeClock(t=1000.0)
+
+    @pytest.fixture
+    def provider(self, clock):
+        return CloudflareTurnProvider(
+            token_id="abcdef1234567890abcdef1234567890",
+            api_token="test-api-token-for-unit-tests",
+            ttl_seconds=3600,
+            fallback_policy="all",
+            failure_threshold=3,
+            circuit_open_duration_seconds=60.0,
+            clock=clock,
+        )
+
+    def _http_500(self):
+        import urllib.error
+        import io
+        return urllib.error.HTTPError(
+            url="https://example.com",
+            code=500,
+            msg="Internal Server Error",
+            hdrs={},
+            fp=io.BytesIO(b"server error"),
+        )
+
+    def test_starts_closed(self, provider):
+        """A fresh provider has a closed circuit."""
+        assert provider.circuit_state == "closed"
+
+    def test_one_failure_does_not_open_circuit(self, provider):
+        with patch("urllib.request.urlopen", side_effect=self._http_500()):
+            with pytest.raises(RuntimeError):
+                provider.get_config()
+        assert provider.circuit_state == "closed"
+        assert provider._consecutive_failures == 1
+
+    def test_threshold_failures_open_circuit(self, provider):
+        """After failure_threshold failures, the circuit opens."""
+        with patch("urllib.request.urlopen", side_effect=self._http_500()):
+            for _ in range(3):
+                with pytest.raises(RuntimeError):
+                    provider.get_config()
+        assert provider.circuit_state == "open"
+        assert provider._consecutive_failures == 3
+
+    def test_open_circuit_fails_fast_without_network_call(self, provider):
+        """While open, get_config raises immediately with no urlopen call.
+
+        This is the production bug fix: no more 15s blocking timeouts.
+        """
+        # Trip the breaker
+        with patch("urllib.request.urlopen", side_effect=self._http_500()):
+            for _ in range(3):
+                with pytest.raises(RuntimeError):
+                    provider.get_config()
+        assert provider.circuit_state == "open"
+
+        # Now subsequent calls must NOT touch the network.
+        with patch("urllib.request.urlopen") as mock_open:
+            with pytest.raises(RuntimeError, match="circuit_open"):
+                provider.get_config()
+            assert mock_open.call_count == 0
+
+    def test_open_to_half_open_after_cooldown(self, provider, clock):
+        """After circuit_open_duration_seconds, state transitions to half_open."""
+        with patch("urllib.request.urlopen", side_effect=self._http_500()):
+            for _ in range(3):
+                with pytest.raises(RuntimeError):
+                    provider.get_config()
+        assert provider.circuit_state == "open"
+
+        clock.advance(61.0)
+        assert provider.circuit_state == "half_open"
+
+    def test_half_open_success_closes_circuit(self, provider, clock):
+        """A successful probe in half_open state closes the circuit."""
+        # Trip
+        with patch("urllib.request.urlopen", side_effect=self._http_500()):
+            for _ in range(3):
+                with pytest.raises(RuntimeError):
+                    provider.get_config()
+
+        clock.advance(61.0)
+        assert provider.circuit_state == "half_open"
+
+        # Probe succeeds
+        mock_data = {"iceServers": [{"urls": "turn:example.com:3478"}]}
+        with patch("urllib.request.urlopen", return_value=_mock_response(mock_data)):
+            config = provider.get_config()
+        assert config["iceServers"]
+        assert provider.circuit_state == "closed"
+        assert provider._consecutive_failures == 0
+
+    def test_half_open_failure_re_opens_circuit(self, provider, clock):
+        """A failed probe in half_open state re-opens the circuit."""
+        # Trip
+        with patch("urllib.request.urlopen", side_effect=self._http_500()):
+            for _ in range(3):
+                with pytest.raises(RuntimeError):
+                    provider.get_config()
+
+        clock.advance(61.0)
+        assert provider.circuit_state == "half_open"
+
+        # Probe fails again — circuit re-opens, cooldown restarts.
+        with patch("urllib.request.urlopen", side_effect=self._http_500()):
+            with pytest.raises(RuntimeError):
+                provider.get_config()
+        assert provider.circuit_state == "open"
+
+    def test_cached_config_bypasses_breaker(self, provider, clock):
+        """A valid cache entry should be returned even if the breaker is open.
+
+        Rationale: the breaker protects against DOWNSTREAM outages, but if we
+        already have a recent valid config in cache, we should serve it.
+        """
+        # Populate cache with a successful call
+        mock_data = {"iceServers": [{"urls": "turn:example.com:3478"}]}
+        with patch("urllib.request.urlopen", return_value=_mock_response(mock_data)):
+            provider.get_config()
+
+        # Manually trip the breaker (simulating a later refresh failure burst)
+        provider._consecutive_failures = 999
+        provider._circuit_opened_at = clock.t
+
+        # Cached call should still return the cached config without raising.
+        # We verify this by NOT advancing the clock past TTL.
+        cfg = provider.get_config()
+        assert cfg["iceServers"]
+
+
+class TestFastFailWallTime:
+    """Sanity check: an open breaker rejects in microseconds, not seconds."""
+
+    def test_open_circuit_rejects_in_under_10ms(self):
+        """The whole point of the breaker is sub-millisecond rejection."""
+        clock = _FakeClock(t=1000.0)
+        provider = CloudflareTurnProvider(
+            token_id="abcdef1234567890abcdef1234567890",
+            api_token="test-api-token-for-unit-tests",
+            ttl_seconds=3600,
+            fallback_policy="all",
+            failure_threshold=1,
+            circuit_open_duration_seconds=60.0,
+            clock=clock,
+        )
+        # Trip with a single failure
+        import urllib.error
+        import io
+        exc = urllib.error.HTTPError("u", 500, "x", {}, io.BytesIO(b""))
+        with patch("urllib.request.urlopen", side_effect=exc):
+            with pytest.raises(RuntimeError):
+                provider.get_config()
+        assert provider.circuit_state == "open"
+
+        # Now measure how long an open-circuit call takes
+        import time as _real_time
+        start = _real_time.perf_counter()
+        with pytest.raises(RuntimeError, match="circuit_open"):
+            provider.get_config()
+        elapsed_ms = (_real_time.perf_counter() - start) * 1000
+        assert elapsed_ms < 10.0, f"Open circuit took {elapsed_ms:.2f}ms, expected <10ms"

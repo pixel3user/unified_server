@@ -9,6 +9,7 @@ import types
 import urllib.error
 import urllib.request
 import asyncio
+from typing import Callable, Optional
 
 from aiohttp import web
 from huggingface_hub import hf_hub_download
@@ -409,7 +410,33 @@ def _patch_frontend() -> None:
 
 
 class CloudflareTurnProvider:
-    def __init__(self, token_id: str, api_token: str, ttl_seconds: int, fallback_policy: str):
+    """Cloudflare TURN credential provider with caching and circuit breaker.
+
+    Circuit breaker states:
+      - closed: normal operation, calls go through to Cloudflare.
+      - open: Cloudflare has failed `failure_threshold` times in a row.
+              Subsequent calls raise RuntimeError immediately (no network),
+              for `circuit_open_duration_seconds` after the last failure.
+              Callers (the route handlers) catch this and use static fallback.
+      - half_open: After the open window elapses, exactly one probe is allowed.
+              Success → closed. Failure → open again.
+
+    Why this matters: when Cloudflare is down, every new WebRTC offer would
+    otherwise block for the full 15s urlopen timeout before falling back to
+    the static ICE config, making the entire signaling endpoint feel hung.
+    """
+
+    def __init__(
+        self,
+        token_id: str,
+        api_token: str,
+        ttl_seconds: int,
+        fallback_policy: str,
+        *,
+        failure_threshold: int = 3,
+        circuit_open_duration_seconds: float = 60.0,
+        clock: Optional[Callable[[], float]] = None,
+    ):
         self.token_id = token_id.strip()
         self.api_token = api_token.strip()
         self.ttl_seconds = max(300, int(ttl_seconds))
@@ -419,6 +446,29 @@ class CloudflareTurnProvider:
         self.last_error = None
         self.last_status_code = None
         self.last_response_excerpt = None
+
+        # Circuit breaker state
+        self.failure_threshold = max(1, int(failure_threshold))
+        self.circuit_open_duration_seconds = float(circuit_open_duration_seconds)
+        self._consecutive_failures = 0
+        # Wall-clock epoch when the circuit was opened (0 = never/closed).
+        # Using injectable clock so tests can drive time deterministically.
+        self._circuit_opened_at = 0.0
+        self._clock = clock or time.time
+
+    @property
+    def circuit_state(self) -> str:
+        """Return 'closed', 'open', or 'half_open' for the current state.
+
+        This is a derived property: the breaker doesn't store a state field,
+        because the state is fully determined by failure count and time.
+        """
+        if self._consecutive_failures < self.failure_threshold:
+            return "closed"
+        elapsed = self._clock() - self._circuit_opened_at
+        if elapsed < self.circuit_open_duration_seconds:
+            return "open"
+        return "half_open"
 
     def debug_identity(self) -> dict:
         token_hash = hashlib.sha256(self.api_token.encode("utf-8")).hexdigest()[:12] if self.api_token else ""
@@ -479,12 +529,39 @@ class CloudflareTurnProvider:
         if self._cached_config is not None and now < self._cached_until:
             return self._cached_config
 
-        config = self._fetch()
+        # Circuit breaker check: if we've failed many times recently, don't
+        # spend 15s on another doomed urlopen — fail fast so the caller can
+        # use its static-config fallback within milliseconds.
+        state = self.circuit_state
+        if state == "open":
+            self.last_error = (
+                f"circuit_open: {self._consecutive_failures} consecutive failures, "
+                f"will retry after {self.circuit_open_duration_seconds:.0f}s"
+            )
+            raise RuntimeError(self.last_error)
+
+        try:
+            config = self._fetch()
+        except Exception:
+            # _fetch already populated last_error/last_status_code via HTTPError
+            # branch; for non-HTTP errors (DNS, conn refused) we set it here.
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self.failure_threshold and self._circuit_opened_at == 0.0:
+                self._circuit_opened_at = self._clock()
+            elif self._consecutive_failures >= self.failure_threshold:
+                # Already open — refresh the open timestamp on each new failure
+                # so the cooldown window starts from the most recent failure.
+                self._circuit_opened_at = self._clock()
+            raise
+
+        # Success: reset breaker and cache.
         # Refresh before expiry so long calls can renegotiate cleanly.
         refresh_window = min(300, max(60, self.ttl_seconds // 10))
         self._cached_config = config
         self._cached_until = now + self.ttl_seconds - refresh_window
         self.last_error = None
+        self._consecutive_failures = 0
+        self._circuit_opened_at = 0.0
         return config
 
 

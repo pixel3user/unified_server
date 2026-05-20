@@ -83,6 +83,10 @@ class FakeMoshiServer:
         self.last_text_prompt: Optional[str] = None
         self.last_voice_prompt: Optional[str] = None
 
+        # Track open websockets so stop() can close them deterministically
+        # instead of waiting for each handler's stream loop to notice client close.
+        self._open_websockets: set = set()
+
         self._app = web.Application()
         self._app.router.add_get("/api/chat", self._handle_chat)
         self._app.router.add_get("/api/avatar/audio", self._handle_mirror)
@@ -104,6 +108,11 @@ class FakeMoshiServer:
 
     async def stop(self) -> None:
         """Gracefully shut down the fake server."""
+        # Close any in-flight websockets first so handler tasks can exit promptly.
+        for ws in list(self._open_websockets):
+            with __import__("contextlib").suppress(Exception):
+                await ws.close()
+        self._open_websockets.clear()
         if self._runner is not None:
             await self._runner.cleanup()
             self._runner = None
@@ -145,24 +154,28 @@ class FakeMoshiServer:
 
         ws = web.WebSocketResponse()
         await ws.prepare(request)
+        self._open_websockets.add(ws)
 
-        # Simulate handshake delay (system prompt / voice loading)
-        if self.handshake_delay_ms > 0:
-            await asyncio.sleep(self.handshake_delay_ms / 1000.0)
-
-        # Send handshake (kind=0, empty payload)
-        await ws.send_bytes(b"\x00")
-
-        # Start concurrent recv (consume uplink) and send (stream audio)
-        recv_task = asyncio.create_task(self._consume_uplink(ws))
         try:
-            await self._stream_audio(ws)
-        finally:
-            recv_task.cancel()
+            # Simulate handshake delay (system prompt / voice loading)
+            if self.handshake_delay_ms > 0:
+                await asyncio.sleep(self.handshake_delay_ms / 1000.0)
+
+            # Send handshake (kind=0, empty payload)
+            await ws.send_bytes(b"\x00")
+
+            # Start concurrent recv (consume uplink) and send (stream audio)
+            recv_task = asyncio.create_task(self._consume_uplink(ws))
             try:
-                await recv_task
-            except asyncio.CancelledError:
-                pass
+                await self._stream_audio(ws)
+            finally:
+                recv_task.cancel()
+                try:
+                    await recv_task
+                except asyncio.CancelledError:
+                    pass
+        finally:
+            self._open_websockets.discard(ws)
 
         return ws
 
@@ -180,14 +193,18 @@ class FakeMoshiServer:
 
         ws = web.WebSocketResponse()
         await ws.prepare(request)
+        self._open_websockets.add(ws)
 
-        # Handshake
-        if self.handshake_delay_ms > 0:
-            await asyncio.sleep(self.handshake_delay_ms / 1000.0)
-        await ws.send_bytes(b"\x00")
+        try:
+            # Handshake
+            if self.handshake_delay_ms > 0:
+                await asyncio.sleep(self.handshake_delay_ms / 1000.0)
+            await ws.send_bytes(b"\x00")
 
-        # Stream audio (no uplink expected in mirror mode)
-        await self._stream_audio(ws)
+            # Stream audio (no uplink expected in mirror mode)
+            await self._stream_audio(ws)
+        finally:
+            self._open_websockets.discard(ws)
         return ws
 
     async def _handle_voices(self, request: web.Request) -> web.Response:
@@ -206,7 +223,13 @@ class FakeMoshiServer:
             pass
 
     async def _stream_audio(self, ws: web.WebSocketResponse) -> None:
-        """Stream synthetic audio chunks at configured cadence."""
+        """Stream synthetic audio chunks at configured cadence.
+
+        Responsive to client close: when ws.send_bytes raises (peer closed)
+        we exit promptly. We also break the cadence sleep into small slices
+        so a graceful close handshake can complete in <100ms instead of
+        having to wait out the full audio_cadence_ms tick.
+        """
         packets_sent = 0
         start = time.monotonic()
 
@@ -236,6 +259,16 @@ class FakeMoshiServer:
                     self.packets_sent_total += 1
                 except (ConnectionResetError, asyncio.CancelledError):
                     return
+                except Exception:
+                    # aiohttp can raise generic errors when the peer is
+                    # mid-close-handshake. Treat as graceful exit.
+                    return
 
-            # Pace at configured cadence
-            await asyncio.sleep(self.audio_cadence_ms / 1000.0)
+            # Pace at configured cadence, but in slices so we notice ws.closed
+            # promptly when the client closes mid-cadence.
+            target = self.audio_cadence_ms / 1000.0
+            slice_size = 0.02  # 20ms slices
+            slept = 0.0
+            while slept < target and not ws.closed:
+                await asyncio.sleep(min(slice_size, target - slept))
+                slept += slice_size

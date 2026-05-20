@@ -274,6 +274,7 @@ if [[ -n "${MUSE_API_TOKEN:-}" ]]; then unified_args+=(--api-token "${MUSE_API_T
 if [[ -n "${MUSE_SESSION_OFFER_TIMEOUT_SECONDS:-}" ]]; then unified_args+=(--session-offer-timeout-seconds "${MUSE_SESSION_OFFER_TIMEOUT_SECONDS}"); fi
 if [[ -n "${MUSE_SESSION_MAX_AGE_SECONDS:-}" ]]; then unified_args+=(--session-max-age-seconds "${MUSE_SESSION_MAX_AGE_SECONDS}"); fi
 if [[ -n "${MUSE_SESSION_CLEANUP_INTERVAL_SECONDS:-}" ]]; then unified_args+=(--session-cleanup-interval-seconds "${MUSE_SESSION_CLEANUP_INTERVAL_SECONDS}"); fi
+if [[ -n "${MUSE_SESSION_DISCONNECT_GRACE_SECONDS:-}" ]]; then unified_args+=(--session-disconnect-grace-seconds "${MUSE_SESSION_DISCONNECT_GRACE_SECONDS}"); fi
 if [[ -n "${MUSE_PERSONAPLEX_EXTRA_QUERY:-}" ]]; then
   IFS=',' read -r -a personaplex_extra_query <<< "${MUSE_PERSONAPLEX_EXTRA_QUERY}"
   for kv in "${personaplex_extra_query[@]}"; do
