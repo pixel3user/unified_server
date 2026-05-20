@@ -201,8 +201,18 @@ class FakeMoshiServer:
                 await asyncio.sleep(self.handshake_delay_ms / 1000.0)
             await ws.send_bytes(b"\x00")
 
-            # Stream audio (no uplink expected in mirror mode)
-            await self._stream_audio(ws)
+            # Stream audio with a concurrent close-watcher so the server
+            # processes the client's close frame promptly (otherwise ws.closed
+            # never flips because nobody is reading from the websocket).
+            close_watcher = asyncio.create_task(self._watch_for_close(ws))
+            try:
+                await self._stream_audio(ws)
+            finally:
+                close_watcher.cancel()
+                try:
+                    await close_watcher
+                except asyncio.CancelledError:
+                    pass
         finally:
             self._open_websockets.discard(ws)
         return ws
@@ -218,6 +228,19 @@ class FakeMoshiServer:
                 if msg.type == web.WSMsgType.BINARY:
                     self.uplink_bytes_received += len(msg.data)
                 elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
+                    break
+        except asyncio.CancelledError:
+            pass
+
+    async def _watch_for_close(self, ws: web.WebSocketResponse) -> None:
+        """Read from websocket solely to detect the client's close frame.
+
+        Used by the mirror handler which has no recv loop. Without this,
+        ws.closed never flips and the stream loop hangs indefinitely.
+        """
+        try:
+            async for msg in ws:
+                if msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR, web.WSMsgType.CLOSED):
                     break
         except asyncio.CancelledError:
             pass
