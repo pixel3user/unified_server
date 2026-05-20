@@ -275,6 +275,7 @@ if [[ -n "${MUSE_SESSION_OFFER_TIMEOUT_SECONDS:-}" ]]; then unified_args+=(--ses
 if [[ -n "${MUSE_SESSION_MAX_AGE_SECONDS:-}" ]]; then unified_args+=(--session-max-age-seconds "${MUSE_SESSION_MAX_AGE_SECONDS}"); fi
 if [[ -n "${MUSE_SESSION_CLEANUP_INTERVAL_SECONDS:-}" ]]; then unified_args+=(--session-cleanup-interval-seconds "${MUSE_SESSION_CLEANUP_INTERVAL_SECONDS}"); fi
 if [[ -n "${MUSE_SESSION_DISCONNECT_GRACE_SECONDS:-}" ]]; then unified_args+=(--session-disconnect-grace-seconds "${MUSE_SESSION_DISCONNECT_GRACE_SECONDS}"); fi
+if [[ -n "${MUSE_ICE_GATHER_TIMEOUT_SECONDS:-}" ]]; then unified_args+=(--ice-gather-timeout-seconds "${MUSE_ICE_GATHER_TIMEOUT_SECONDS}"); fi
 if [[ -n "${MUSE_PERSONAPLEX_EXTRA_QUERY:-}" ]]; then
   IFS=',' read -r -a personaplex_extra_query <<< "${MUSE_PERSONAPLEX_EXTRA_QUERY}"
   for kv in "${personaplex_extra_query[@]}"; do
@@ -294,20 +295,74 @@ if [[ "${MUSE_WEB_TEST_ONLY:-0}" == "1" ]]; then unified_args+=(--web-test-only)
 if [[ "${DEBUG_WEBRTC}" == "1" ]]; then unified_args+=(--debug); fi
 if [[ -n "${MUSE_DEBUG_EVENTS_LIMIT:-}" ]]; then unified_args+=(--debug-events-limit "${MUSE_DEBUG_EVENTS_LIMIT}"); fi
 
-# Launch the single server process
-# Pass ice_args as command-line arguments
-python /opt/onebox/unified_server.py "${unified_args[@]}" "${ice_args[@]}" &
-unified_server_pid=$!
-
-log "Unified Server started (PID: ${unified_server_pid})"
-
+# Launch the single server process with restart loop
 # ============================================================================
-# Wait for services and handle shutdown
+# Restart policy:
+# - Max RESTART_MAX_ATTEMPTS restarts (default 5).
+# - Exponential backoff between restarts (1s, 2s, 4s, 8s, capped at 30s).
+# - If the server runs successfully for >RESTART_STABLE_SECONDS (default 60s),
+#   the attempt counter resets (it was a transient crash, not a boot loop).
+# - If max attempts exhausted, exit non-zero so the platform restarts fresh.
 # ============================================================================
-set +e
-wait -n "${unified_server_pid}" ${turn_pid:+"${turn_pid}"}
-status=$?
-set -e
+RESTART_MAX_ATTEMPTS="${RESTART_MAX_ATTEMPTS:-5}"
+RESTART_STABLE_SECONDS="${RESTART_STABLE_SECONDS:-60}"
+RESTART_BACKOFF_BASE="${RESTART_BACKOFF_BASE:-1}"
+RESTART_BACKOFF_CAP="${RESTART_BACKOFF_CAP:-30}"
 
-log "a service exited (status=${status}), shutting down."
-exit "${status}"
+attempt=0
+backoff="${RESTART_BACKOFF_BASE}"
+
+while true; do
+  start_epoch=$(date +%s)
+
+  python /opt/onebox/unified_server.py "${unified_args[@]}" "${ice_args[@]}" &
+  unified_server_pid=$!
+  log "Unified Server started (PID: ${unified_server_pid}, attempt: ${attempt})"
+
+  # Wait for either the server or TURN to exit
+  set +e
+  wait -n "${unified_server_pid}" ${turn_pid:+"${turn_pid}"}
+  status=$?
+  set -e
+
+  end_epoch=$(date +%s)
+  runtime=$((end_epoch - start_epoch))
+
+  # If TURN exited (not the server), shut down entirely
+  if [[ -n "${turn_pid}" ]] && ! kill -0 "${turn_pid}" 2>/dev/null; then
+    log "TURN server exited. Shutting down."
+    kill "${unified_server_pid}" 2>/dev/null || true
+    exit "${status}"
+  fi
+
+  # Server exited. Check if it was a clean shutdown (SIGTERM from Docker stop)
+  if [[ ${status} -eq 0 || ${status} -eq 143 ]]; then
+    log "Unified Server exited cleanly (status=${status}). Shutting down."
+    exit 0
+  fi
+
+  # Server crashed. Decide whether to restart.
+  log "Unified Server crashed (status=${status}, runtime=${runtime}s, attempt=${attempt}/${RESTART_MAX_ATTEMPTS})"
+
+  # If it ran long enough, consider it stable → reset backoff
+  if [[ ${runtime} -ge ${RESTART_STABLE_SECONDS} ]]; then
+    attempt=0
+    backoff="${RESTART_BACKOFF_BASE}"
+    log "Server was stable for ${runtime}s. Resetting restart counter."
+  fi
+
+  attempt=$((attempt + 1))
+  if [[ ${attempt} -gt ${RESTART_MAX_ATTEMPTS} ]]; then
+    log "FATAL: Exceeded max restart attempts (${RESTART_MAX_ATTEMPTS}). Giving up."
+    exit "${status}"
+  fi
+
+  log "Restarting in ${backoff}s..."
+  sleep "${backoff}"
+
+  # Exponential backoff: double, cap at RESTART_BACKOFF_CAP
+  backoff=$((backoff * 2))
+  if [[ ${backoff} -gt ${RESTART_BACKOFF_CAP} ]]; then
+    backoff="${RESTART_BACKOFF_CAP}"
+  fi
+done

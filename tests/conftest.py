@@ -116,6 +116,7 @@ def make_test_args(**overrides) -> "AppArgs":
         session_max_age_seconds=3600.0,
         session_cleanup_interval_seconds=10.0,
         session_disconnect_grace_seconds=10.0,
+        ice_gather_timeout_seconds=5.0,
         single_session_mode=True,
         web_test_only=False,
         debug=True,

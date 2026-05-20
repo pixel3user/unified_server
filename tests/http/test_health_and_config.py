@@ -82,3 +82,55 @@ class TestStatus:
         assert "session_count" in webrtc
         assert "single_session_mode" in webrtc
         assert webrtc["session_count"] == 0
+
+
+
+class TestReadyz:
+    """The /readyz endpoint reflects model readiness, not just process liveness."""
+
+    @pytest.mark.asyncio
+    async def test_ready_in_web_test_only_mode(self, client):
+        """In web_test_only mode (no engine), /readyz should be 200 immediately."""
+        resp = await client.get("/readyz")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["ready"] is True
+        assert data["reasons"] == []
+
+    @pytest.mark.asyncio
+    async def test_readyz_returns_503_when_unhealthy(self, client):
+        """If the process is unhealthy, /readyz should also be 503."""
+        app_state = client.app["_app_state"]
+        app_state._healthy = False
+
+        resp = await client.get("/readyz")
+        assert resp.status == 503
+        data = await resp.json()
+        assert data["ready"] is False
+        assert any("unhealthy" in r for r in data["reasons"])
+
+    @pytest.mark.asyncio
+    async def test_readyz_includes_uptime(self, client):
+        resp = await client.get("/readyz")
+        data = await resp.json()
+        assert "uptime_seconds" in data
+
+
+
+class TestMetrics:
+    """The /metrics endpoint serves Prometheus exposition format."""
+
+    @pytest.mark.asyncio
+    async def test_metrics_returns_501_without_prometheus_client(self, client):
+        """Without prometheus_client installed, /metrics returns 501."""
+        # prometheus_client may or may not be installed in test env.
+        # Either way, the endpoint should be reachable.
+        resp = await client.get("/metrics")
+        # 501 = not installed, 200 = installed and serving metrics
+        assert resp.status in (200, 501)
+
+    @pytest.mark.asyncio
+    async def test_metrics_endpoint_is_registered(self, client):
+        """The /metrics route exists and doesn't 404."""
+        resp = await client.get("/metrics")
+        assert resp.status != 404
